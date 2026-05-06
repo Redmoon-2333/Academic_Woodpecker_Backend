@@ -124,45 +124,36 @@ async def get_records(
 async def get_stats(db: AsyncSession, user_id: int) -> LearningStats:
     """Get aggregated learning statistics for a user."""
     try:
-        # Total per action
-        r1 = await db.execute(
-            select(func.count()).where(
-                UserLearningRecord.user_id == user_id,
-                UserLearningRecord.action == LearningAction.viewed,
-            )
-        )
-        r2 = await db.execute(
-            select(func.count()).where(
-                UserLearningRecord.user_id == user_id,
-                UserLearningRecord.action == LearningAction.studied,
-            )
-        )
-        r3 = await db.execute(
-            select(func.count()).where(
-                UserLearningRecord.user_id == user_id,
-                UserLearningRecord.action == LearningAction.completed,
-            )
-        )
-        r4 = await db.execute(
-            select(func.coalesce(func.sum(UserLearningRecord.duration_seconds), 0)).where(
-                UserLearningRecord.user_id == user_id,
-            )
-        )
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        r5 = await db.execute(
-            select(func.count()).where(
-                UserLearningRecord.user_id == user_id,
-                UserLearningRecord.created_at >= today_start,
-            )
+        stats_result = await db.execute(
+            select(
+                func.sum(func.case(
+                    (UserLearningRecord.action == LearningAction.viewed, 1),
+                    else_=0
+                )).label('total_viewed'),
+                func.sum(func.case(
+                    (UserLearningRecord.action == LearningAction.studied, 1),
+                    else_=0
+                )).label('total_studied'),
+                func.sum(func.case(
+                    (UserLearningRecord.action == LearningAction.completed, 1),
+                    else_=0
+                )).label('total_completed'),
+                func.coalesce(func.sum(UserLearningRecord.duration_seconds), 0).label('total_duration'),
+                func.sum(func.case(
+                    (UserLearningRecord.created_at >= today_start, 1),
+                    else_=0
+                )).label('today_records')
+            ).where(UserLearningRecord.user_id == user_id)
         )
 
-        total_viewed = r1.scalar() or 0
-        total_studied = r2.scalar() or 0
-        total_completed = r3.scalar() or 0
-        total_duration = r4.scalar() or 0
-        today_records = r5.scalar() or 0
+        row = stats_result.first()
+        total_viewed = int(row.total_viewed or 0)
+        total_studied = int(row.total_studied or 0)
+        total_completed = int(row.total_completed or 0)
+        total_duration = int(row.total_duration or 0)
+        today_records = int(row.today_records or 0)
 
-        # Streak: simple approach, fetch distinct dates, count consecutive from today
         streak_rows = (await db.execute(
             select(func.date(UserLearningRecord.created_at))
             .where(UserLearningRecord.user_id == user_id)
@@ -194,5 +185,4 @@ async def get_stats(db: AsyncSession, user_id: int) -> LearningStats:
             streak_days=streak_days,
         )
     except Exception as e:
-        # Fallback: return empty stats on error
         return LearningStats()
