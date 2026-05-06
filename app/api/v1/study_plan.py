@@ -26,8 +26,8 @@ async def get_current_plan(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取当前学习计划"""
-    data = await study_plan_service.get_current_plan(db, current_user.id)
+    """获取当前学习计划（今日目标适配版）"""
+    data = await study_plan_service.get_current_plan_today(db, current_user.id)
     return UnifiedResponse(data=data)
 
 

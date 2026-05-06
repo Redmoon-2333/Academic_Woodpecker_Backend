@@ -8,6 +8,9 @@ from app.schemas.mentor import (
     MentorHistoryItem, SuggestedAction,
 )
 from app.agents.mentor_agent import chat_with_mentor, chat_with_mentor_stream
+from app.core.logging import get_logger
+
+logger = get_logger("mentor_service")
 
 
 async def chat(
@@ -31,7 +34,13 @@ async def chat(
     try:
         ai_content = await chat_with_mentor(req.message, req.context, thread_id)
     except Exception as e:
-        ai_content = f"抱歉，我暂时无法回答这个问题。请稍后再试。"
+        logger.error(f"Mentor chat failed: {type(e).__name__}: {e}")
+        import traceback; logger.error(traceback.format_exc())
+        ai_content = (
+            "抱歉，AI 助手暂时无法响应——可能是后端 LLM 服务异常。\n"
+            f"错误类型：{type(e).__name__}\n"
+            "请稍后重试，或联系管理员检查 LLM API 配置。"
+        )
 
     # Save AI response
     ai_msg = ChatMessage(

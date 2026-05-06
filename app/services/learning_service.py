@@ -1,8 +1,8 @@
 """Service for tracking user learning activities."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc, and_, text
+from sqlalchemy import select, func, desc, and_
 from app.models.learning_record import UserLearningRecord, LearningAction
 from app.models.resource import Resource
 from app.schemas.learning import (
@@ -41,6 +41,7 @@ async def create_record(
         action=action,
         content=content,
         duration_seconds=req.duration_seconds,
+        created_at=datetime.utcnow(),
     )
     db.add(record)
     await db.commit()
@@ -123,66 +124,75 @@ async def get_records(
 
 async def get_stats(db: AsyncSession, user_id: int) -> LearningStats:
     """Get aggregated learning statistics for a user."""
-    try:
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        stats_result = await db.execute(
-            select(
-                func.sum(func.case(
-                    (UserLearningRecord.action == LearningAction.viewed, 1),
-                    else_=0
-                )).label('total_viewed'),
-                func.sum(func.case(
-                    (UserLearningRecord.action == LearningAction.studied, 1),
-                    else_=0
-                )).label('total_studied'),
-                func.sum(func.case(
-                    (UserLearningRecord.action == LearningAction.completed, 1),
-                    else_=0
-                )).label('total_completed'),
-                func.coalesce(func.sum(UserLearningRecord.duration_seconds), 0).label('total_duration'),
-                func.sum(func.case(
-                    (UserLearningRecord.created_at >= today_start, 1),
-                    else_=0
-                )).label('today_records')
-            ).where(UserLearningRecord.user_id == user_id)
+    # Use UTC for consistency
+    utc_now = datetime.now(timezone.utc)
+    utc_today_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = utc_today_start.replace(tzinfo=None)
+
+    # All-time stats: use subqueries instead of CASE for reliability
+    result = await db.execute(
+        select(func.count(UserLearningRecord.id))
+        .where(UserLearningRecord.user_id == user_id, UserLearningRecord.action == "viewed")
+    )
+    total_viewed = result.scalar() or 0
+
+    result = await db.execute(
+        select(func.count(UserLearningRecord.id))
+        .where(UserLearningRecord.user_id == user_id, UserLearningRecord.action == "studied")
+    )
+    total_studied = result.scalar() or 0
+
+    result = await db.execute(
+        select(func.count(UserLearningRecord.id))
+        .where(UserLearningRecord.user_id == user_id, UserLearningRecord.action == "completed")
+    )
+    total_completed = result.scalar() or 0
+
+    result = await db.execute(
+        select(func.coalesce(func.sum(UserLearningRecord.duration_seconds), 0))
+        .where(UserLearningRecord.user_id == user_id)
+    )
+    total_duration = result.scalar() or 0
+
+    # Today's records
+    result = await db.execute(
+        select(func.count(UserLearningRecord.id))
+        .where(
+            and_(
+                UserLearningRecord.user_id == user_id,
+                UserLearningRecord.created_at >= today_start,
+            )
         )
+    )
+    today_records = result.scalar() or 0
 
-        row = stats_result.first()
-        total_viewed = int(row.total_viewed or 0)
-        total_studied = int(row.total_studied or 0)
-        total_completed = int(row.total_completed or 0)
-        total_duration = int(row.total_duration or 0)
-        today_records = int(row.today_records or 0)
+    # Streak
+    streak_rows = (await db.execute(
+        select(func.date(UserLearningRecord.created_at))
+        .where(UserLearningRecord.user_id == user_id)
+        .distinct()
+        .order_by(desc(func.date(UserLearningRecord.created_at)))
+    )).scalars().all()
 
-        streak_rows = (await db.execute(
-            select(func.date(UserLearningRecord.created_at))
-            .where(UserLearningRecord.user_id == user_id)
-            .distinct()
-            .order_by(desc(func.date(UserLearningRecord.created_at)))
-        )).scalars().all()
+    streak_days = 0
+    if streak_rows:
+        today_date = datetime.now().date()
+        for i, day_str in enumerate(streak_rows):
+            if isinstance(day_str, str):
+                day_date = date.fromisoformat(day_str)
+            else:
+                day_date = day_str
+            expected = today_date - timedelta(days=i)
+            if day_date == expected:
+                streak_days += 1
+            else:
+                break
 
-        streak_days = 0
-        if streak_rows:
-            today_date = datetime.now().date()
-            for i, day_str in enumerate(streak_rows):
-                from datetime import date
-                if isinstance(day_str, str):
-                    day_date = date.fromisoformat(day_str)
-                else:
-                    day_date = day_str
-                expected = today_date - timedelta(days=i)
-                if day_date == expected:
-                    streak_days += 1
-                else:
-                    break
-
-        return LearningStats(
-            total_viewed=total_viewed,
-            total_studied=total_studied,
-            total_completed=total_completed,
-            total_duration_minutes=round(total_duration / 60, 1),
-            today_records=today_records,
-            streak_days=streak_days,
-        )
-    except Exception as e:
-        return LearningStats()
+    return LearningStats(
+        total_viewed=total_viewed,
+        total_studied=total_studied,
+        total_completed=total_completed,
+        total_duration_minutes=round(total_duration / 60, 1),
+        today_records=today_records,
+        streak_days=streak_days,
+    )

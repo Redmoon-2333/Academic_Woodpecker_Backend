@@ -27,7 +27,7 @@ class AnalysisResultSchema(BaseModel):
     summary: str = Field(description="分析总结文字，100-200字")
 
 
-ANALYSIS_PROMPT = """你是一位专业的教育AI分析助手。分析学生上传的学习文档，提取知识点，识别薄弱环节，给出学习建议。
+SYSTEM_PROMPT = """你是一位专业的教育AI分析助手。分析学生上传的学习文档，提取知识点，识别薄弱环节，给出学习建议。
 
 分析重点：
 1. 提取所有提到的学科/知识点
@@ -47,73 +47,98 @@ ANALYSIS_PROMPT = """你是一位专业的教育AI分析助手。分析学生上
   "summary": "总结文字"
 }"""
 
+RETRY_PROMPT = "请重新分析以下文档内容，严格按JSON格式输出，不要包含任何解释或markdown标记："
+
+
+def _parse_result(content: str) -> Dict:
+    """Parse LLM output into analysis result dict. Handles JSON with markdown wrappers."""
+    # Strip possible markdown code fences
+    content = content.strip()
+    if content.startswith("```"):
+        lines = content.split("\n")
+        # Remove first and last lines if they are markdown code fences
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+    result_data = json.loads(content)
+    return {
+        "extractedKnowledge": [
+            {"name": k["name"], "confidence": k["confidence"]}
+            for k in result_data.get("extracted_knowledge", [])
+        ],
+        "weakPoints": [
+            {"name": wp["name"], "severity": wp["severity"]}
+            for wp in result_data.get("weak_points", [])
+        ],
+        "suggestions": result_data.get("suggestions", []),
+        "summary": result_data.get("summary", ""),
+    }
+
 
 class AnalysisChain:
-    def __init__(self):
+    def __init__(self, max_retries: int = 2):
         self.client = AsyncOpenAI(
             api_key=settings.ECNU_API_KEY,
             base_url=settings.ECNU_API_BASE,
         )
         self.model = settings.LLM_MODEL
-        logger.info(f"AnalysisChain initialized: model={self.model}, base_url={settings.ECNU_API_BASE}")
+        self.max_retries = max_retries
+        logger.info(f"AnalysisChain initialized: model={self.model}")
 
     async def analyze(self, document_text: str) -> Dict:
-        """Analyze document text and return structured analysis."""
         text_length = len(document_text)
         logger.info(f"Starting document analysis, text_length={text_length}")
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": ANALYSIS_PROMPT},
-                    {"role": "user", "content": f"请分析以下文档内容：\n{document_text[:8000]}"},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=2048,
-                temperature=0.7,
-            )
+        truncated = document_text[:8000]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"请分析以下文档内容：\n{truncated}"},
+        ]
 
-            content = response.choices[0].message.content
-            logger.info(f"Raw LLM response: {content[:200]}...")
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=2048,
+                    temperature=0.3 + (attempt - 1) * 0.2,  # gradually increase
+                )
+                content = response.choices[0].message.content or "{}"
+                logger.info(f"Analysis attempt {attempt}: {content[:150]}...")
+                result = _parse_result(content)
 
-            result_data = json.loads(content)
+                # Validate: must have at least one extracted knowledge point
+                if result["extractedKnowledge"]:
+                    logger.info(
+                        f"Analysis completed: {len(result['extractedKnowledge'])} knowledge, "
+                        f"{len(result['weakPoints'])} weak points"
+                    )
+                    return result
+                else:
+                    logger.warning(f"Analysis attempt {attempt}: empty knowledge, retrying...")
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": RETRY_PROMPT})
 
-            result = {
-                "extractedKnowledge": [
-                    {"name": k["name"], "confidence": k["confidence"]}
-                    for k in result_data.get("extracted_knowledge", [])
-                ],
-                "weakPoints": [
-                    {"name": wp["name"], "severity": wp["severity"]}
-                    for wp in result_data.get("weak_points", [])
-                ],
-                "suggestions": result_data.get("suggestions", []),
-                "summary": result_data.get("summary", ""),
-            }
+            except json.JSONDecodeError as e:
+                last_error = f"JSON parse failed: {e}"
+                logger.warning(f"Analysis attempt {attempt}: {last_error}")
+                messages.append({"role": "user", "content": RETRY_PROMPT})
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.error(f"Analysis attempt {attempt} failed: {last_error}\n{traceback.format_exc()}")
 
-            logger.info(
-                f"Analysis completed: extracted {len(result['extractedKnowledge'])} knowledge points, "
-                f"{len(result['weakPoints'])} weak points"
-            )
-            return result
-
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse failed: {e}, content={content if 'content' in locals() else 'N/A'}")
-            return self._fallback_result()
-        except Exception as e:
-            logger.error(
-                f"Analysis chain failed: type={type(e).__name__}, error={str(e)}, "
-                f"traceback={traceback.format_exc()}"
-            )
-            return self._fallback_result()
-
-    def _fallback_result(self) -> Dict:
+        # All retries exhausted
+        logger.error(f"All {self.max_retries} analysis attempts failed. Last error: {last_error}")
         return {
-            "extractedKnowledge": [{"name": "文档内容", "confidence": 0.5}],
-            "weakPoints": [{"name": "待确认", "severity": "medium"}],
-            "suggestions": ["请重新上传文档或手动补充知识点"],
-            "summary": "AI分析暂时不可用，请稍后重试。",
+            "extractedKnowledge": [],
+            "weakPoints": [],
+            "suggestions": ["AI分析暂时不可用，请稍后重新上传。"],
+            "summary": f"分析失败（{last_error}），请稍后重试。",
+            "error": last_error,
         }
 
 

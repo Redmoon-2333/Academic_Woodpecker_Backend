@@ -1,8 +1,10 @@
+"""Study plan generation and management service."""
 import uuid
 from datetime import datetime
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
+from sqlalchemy.orm.attributes import flag_modified
 from app.models.study_plan import StudyPlan
 from app.schemas.study_plan import (
     GeneratePlanRequest, PlanResponse, WeekPlan,
@@ -56,6 +58,50 @@ async def get_current_plan(db: AsyncSession, user_id: int) -> Optional[PlanRespo
     return _build_plan_response(plan)
 
 
+async def get_current_plan_today(db: AsyncSession, user_id: int) -> dict:
+    """Get today's learning goals adapted from current study plan."""
+    from app.schemas.today import TodayGoalItem, TodayGoalsData
+
+    result = await db.execute(
+        select(StudyPlan)
+        .where(StudyPlan.user_id == user_id)
+        .order_by(desc(StudyPlan.created_at))
+        .limit(1)
+    )
+    plan = result.scalar_one_or_none()
+
+    if not plan:
+        return TodayGoalsData(
+            planId=None,
+            todayGoals=[],
+            studyTips=["上传成绩单或试卷即可生成个性化学习计划"],
+        ).model_dump()
+
+    plan_data = plan.plan_data or {}
+    weeks = plan_data.get("weeks", [])
+
+    today_goals = []
+    if weeks:
+        first_week = weeks[0]
+        for i, task in enumerate(first_week.get("tasks", [])[:5]):
+            today_goals.append(TodayGoalItem(
+                id=f"goal_{plan.id}_{i+1}",
+                title=task.get("content", f"学习任务{i+1}"),
+                estimatedMinutes=task.get("estimatedMinutes", 30),
+                completed=task.get("completed", False),
+            ))
+
+    return TodayGoalsData(
+        planId=plan.id,
+        todayGoals=today_goals,
+        studyTips=[
+            "建议先复习基础知识再做题",
+            "注意劳逸结合，每学习45分钟休息10分钟",
+            "睡前复习当天学习内容效果更佳",
+        ],
+    ).model_dump()
+
+
 async def update_progress(
     db: AsyncSession,
     user_id: int,
@@ -80,6 +126,7 @@ async def update_progress(
                     break
 
     plan.plan_data = plan_data
+    flag_modified(plan, "plan_data")
     await db.commit()
     return {"message": "进度已更新"}
 
